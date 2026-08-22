@@ -1,7 +1,7 @@
 {
   "name": "game-server",
   "version": "1.0.0",
-  "description": "High-performance multiplayer game server",
+  "description": "Multiplayer game server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -16,13 +16,5 @@
   },
   "engines": {
     "node": ">=16.0.0"
-  },
-  "keywords": [
-    "game",
-    "multiplayer",
-    "websocket",
-    "realtime"
-  ],
-  "author": "Your Name",
-  "license": "MIT"
+  }
 }
