@@ -4,34 +4,37 @@ const http = require('http');
 
 // ==================== تنظیمات کلی ====================
 const PORT = process.env.PORT || 7000;
-const MAX_PLAYERS = 5;
+const MAX_PLAYERS = 2;                      // برای روان و سریع بودن، فقط ۲ بازیکن (مبارزه‌ی رودررو)
 const TICK_RATE = 30;                       // تعداد تیک سرور در ثانیه
 const PING_INTERVAL = 5000;                 // فاصله پینگ/heartbeat سرور (ms)
 const STATE_BROADCAST_EVERY_N_TICKS = 15;   // پخش وضعیت کامل برای هماهنگی (~هر نیم ثانیه)
 
 // نقشه نامحدود است — هیچ محدودیتی برای x/y وجود ندارد.
-// بازیکنان و سکه‌ها همیشه نسبت به بازیکنان فعلی (نه یک جعبه‌ی ثابت) موقعیت‌دهی می‌شوند.
+// بازیکنان و سکه‌ها همیشه نسبت به بازیکنان فعلیِ زنده (نه یک جعبه‌ی ثابت) موقعیت‌دهی می‌شوند.
 
 // تنظیمات سکه‌ها
 const MAX_COINS = 10;
 const COIN_MIN_SPAWN_MS = 1200;
 const COIN_MAX_SPAWN_MS = 2800;
-const COIN_NEAR_MIN_DIST = 120;             // حداقل فاصله‌ی سکه از بازیکن مرجع
-const COIN_NEAR_MAX_DIST = 320;             // حداکثر فاصله (فاصله‌ی نسبتاً زیاد طبق درخواست)
+const COIN_NEAR_MIN_DIST = 150;
+const COIN_NEAR_MAX_DIST = 350;
 const COIN_BONUS_CHANCE = 0.15;
 const COIN_NORMAL_VALUE = 1;
 const COIN_BONUS_VALUE = 5;
 const COLLECT_TOLERANCE = 50;               // شعاع مجاز جمع‌آوری سکه در سرور (px)
 
 // تنظیمات اسپاون بازیکن (بازیکنان نزدیک هم ظاهر می‌شوند)
-const PLAYER_SPAWN_NEAR_MIN_DIST = 70;
-const PLAYER_SPAWN_NEAR_MAX_DIST = 160;
+const PLAYER_SPAWN_NEAR_MIN_DIST = 120;
+const PLAYER_SPAWN_NEAR_MAX_DIST = 220;
 
-// تنظیمات سلامتی و ضربه
+// تنظیمات سلامتی، ضربه، ترمیم و بازگشت به بازی
 const MAX_HEALTH = 100;
 const ATTACK_DAMAGE = 20;
-const ATTACK_RANGE = 75;                    // شعاع مؤثر ضربه (باید با اندازه AttackArea کلاینت هم‌خوان باشد)
-const ATTACK_COOLDOWN_MS = 600;
+const ATTACK_RANGE = 130;                   // بازه‌ی تایید سرور (سخاوتمندانه)؛ تشخیص اصلیِ هدف با AttackArea خودِ کلاینت است
+const ATTACK_COOLDOWN_MS = 500;             // باید با attack_cooldown اسکریپت کلاینت (0.5s) هماهنگ باشد
+const HEALTH_REGEN_DELAY_MS = 5000;         // بعد از این مدت بدون آسیب دیدن، ترمیم آرام شروع می‌شود
+const HEALTH_REGEN_PER_SECOND = 15;         // سرعت ترمیم تدریجی سلامتی (نه یکباره)
+const RESPAWN_DELAY_MS = 5000;              // بعد از باخت، این مدت بعد به‌طور خودکار به بازی برمی‌گردد
 
 // ==================== وضعیت بازی ====================
 const gameState = {
@@ -51,8 +54,11 @@ class Player {
         this.x = spawnPos.x;
         this.y = spawnPos.y;
         this.score = 0;
-        this.health = MAX_HEALTH;
+        this.health = MAX_HEALTH;           // به‌صورت داخلی float نگه داشته می‌شود تا ترمیم کاملاً نرم باشد
+        this.isDead = false;
+        this.deadUntil = 0;
         this.lastAttackTime = 0;
+        this.lastDamageTime = 0;
         this.lastUpdate = Date.now();
         this.lastPing = Date.now();
         this.ping = 0;
@@ -65,7 +71,8 @@ class Player {
             x: Math.round(this.x * 100) / 100,
             y: Math.round(this.y * 100) / 100,
             score: this.score,
-            health: this.health,
+            health: Math.round(this.health),
+            isDead: this.isDead,
             ping: this.ping
         };
     }
@@ -83,6 +90,7 @@ class Player {
     }
 
     updatePosition(x, y) {
+        if (this.isDead) return false;
         if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
             return false;
         }
@@ -103,10 +111,10 @@ function broadcast(data, excludeId = null) {
     });
 }
 
-// ==================== موقعیت‌دهی نسبی به بازیکنان فعلی (چون نقشه نامحدود است) ====================
-function pickRandomExistingPlayer() {
-    if (gameState.players.size === 0) return null;
-    const arr = Array.from(gameState.players.values());
+// ==================== موقعیت‌دهی نسبی به بازیکنان زنده‌ی فعلی ====================
+function pickRandomExistingPlayer(excludeId) {
+    const arr = Array.from(gameState.players.values()).filter(p => p.id !== excludeId && !p.isDead);
+    if (arr.length === 0) return null;
     return arr[Math.floor(Math.random() * arr.length)];
 }
 
@@ -116,26 +124,19 @@ function randomOffset(minDist, maxDist) {
     return { x: Math.cos(angle) * dist, y: Math.sin(angle) * dist };
 }
 
-function spawnPositionForNewPlayer() {
-    const ref = pickRandomExistingPlayer();
-    if (!ref) return { x: 0, y: 0 }; // اولین بازیکن، مبدأ دنیای بازی
-    const off = randomOffset(PLAYER_SPAWN_NEAR_MIN_DIST, PLAYER_SPAWN_NEAR_MAX_DIST);
-    return { x: ref.x + off.x, y: ref.y + off.y };
-}
-
-function spawnPositionForCoin() {
-    const ref = pickRandomExistingPlayer();
-    if (!ref) return { x: 0, y: 0 };
-    const off = randomOffset(COIN_NEAR_MIN_DIST, COIN_NEAR_MAX_DIST);
+function computeSpawnPosition(excludeId, minDist, maxDist) {
+    const ref = pickRandomExistingPlayer(excludeId);
+    if (!ref) return { x: 0, y: 0 }; // اولین بازیکن یا بدون بازیکن زنده‌ی دیگر
+    const off = randomOffset(minDist, maxDist);
     return { x: ref.x + off.x, y: ref.y + off.y };
 }
 
 // ==================== مدیریت سکه‌ها ====================
 function spawnCoin() {
     if (gameState.coins.size >= MAX_COINS) return;
-    if (gameState.players.size === 0) return; // بدون بازیکن، سکه لازم نیست ظاهر شود
+    if (gameState.players.size === 0) return;
 
-    const pos = spawnPositionForCoin();
+    const pos = computeSpawnPosition(null, COIN_NEAR_MIN_DIST, COIN_NEAR_MAX_DIST);
     const isBonus = Math.random() < COIN_BONUS_CHANCE;
     const coin = {
         id: gameState.nextCoinId++,
@@ -178,25 +179,42 @@ function tryCollectCoin(player, coinId) {
     });
 }
 
-// ==================== سیستم ضربه و سلامتی ====================
-function tryAttack(attacker) {
+// ==================== سیستم ضربه ====================
+function tryAttack(attacker, requestedTargetId, attackType) {
+    if (attacker.isDead) return;
+
     const now = Date.now();
     if (now - attacker.lastAttackTime < ATTACK_COOLDOWN_MS) return;
     attacker.lastAttackTime = now;
 
     let target = null;
-    let bestDist = Infinity;
 
-    gameState.players.forEach((p) => {
-        if (p.id === attacker.id) return;
-        const dx = p.x - attacker.x;
-        const dy = p.y - attacker.y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist <= ATTACK_RANGE && dist < bestDist) {
-            bestDist = dist;
-            target = p;
+    // اولویت با هدفی است که خودِ کلاینت (با AttackArea داخل بازی) تشخیص داده
+    if (requestedTargetId !== null && requestedTargetId !== undefined) {
+        const candidate = gameState.players.get(requestedTargetId);
+        if (candidate && candidate.id !== attacker.id && !candidate.isDead) {
+            const dx = candidate.x - attacker.x;
+            const dy = candidate.y - attacker.y;
+            if (Math.sqrt(dx * dx + dy * dy) <= ATTACK_RANGE) {
+                target = candidate;
+            }
         }
-    });
+    }
+
+    // در نبود هدف معتبر، نزدیک‌ترین بازیکنِ زنده‌ی داخل برد به‌عنوان جایگزین
+    if (!target) {
+        let bestDist = Infinity;
+        gameState.players.forEach((p) => {
+            if (p.id === attacker.id || p.isDead) return;
+            const dx = p.x - attacker.x;
+            const dy = p.y - attacker.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist <= ATTACK_RANGE && dist < bestDist) {
+                bestDist = dist;
+                target = p;
+            }
+        });
+    }
 
     if (!target) {
         // ضربه به هوا خورده؛ فقط انیمیشن حمله برای بقیه پخش شود
@@ -204,6 +222,7 @@ function tryAttack(attacker) {
             type: 'PLAYER_ATTACKED',
             attackerId: attacker.id,
             targetId: null,
+            attackType,
             attackerX: attacker.x,
             attackerY: attacker.y
         });
@@ -211,12 +230,14 @@ function tryAttack(attacker) {
     }
 
     target.health = Math.max(0, target.health - ATTACK_DAMAGE);
+    target.lastDamageTime = now;
 
     broadcast({
         type: 'PLAYER_ATTACKED',
         attackerId: attacker.id,
         targetId: target.id,
-        targetHealth: target.health,
+        attackType,
+        targetHealth: Math.round(target.health),
         attackerX: attacker.x,
         attackerY: attacker.y,
         targetX: target.x,
@@ -224,25 +245,46 @@ function tryAttack(attacker) {
     });
 
     if (target.health <= 0) {
-        defeatPlayer(target);
+        killPlayer(target);
     }
 }
 
-function defeatPlayer(player) {
-    gameState.players.delete(player.id);
+function killPlayer(player) {
+    player.isDead = true;
+    player.health = 0;
+    player.deadUntil = Date.now() + RESPAWN_DELAY_MS;
+    broadcast({ type: 'PLAYER_DIED', playerId: player.id, respawnInMs: RESPAWN_DELAY_MS });
+}
 
-    // به بقیه اطلاع بده که این بازیکن از بازی حذف شد (بدون ارسال به خود بازیکن باخته)
-    broadcast({ type: 'PLAYER_DEFEATED', playerId: player.id }, player.id);
+// ==================== ترمیم تدریجی سلامتی + بازگشت خودکار بعد از باخت ====================
+function processHealthAndRespawn() {
+    const now = Date.now();
 
-    // به خود بازیکن باخته پیام اختصاصی بده
-    player.send({ type: 'YOU_LOST', message: 'شما باختید! حریف شما را شکست داد.' });
-
-    // کمی مهلت برای رسیدن پیام، سپس اتصال را تمیز ببند تا کلاینت وارد چرخه‌ی «بازی دوباره» شود
-    setTimeout(() => {
-        if (player.ws && player.ws.readyState === WebSocket.OPEN) {
-            player.ws.close(1000, 'defeated');
+    gameState.players.forEach((p) => {
+        if (p.isDead) {
+            if (now >= p.deadUntil) {
+                p.isDead = false;
+                p.health = MAX_HEALTH;
+                p.lastDamageTime = now;
+                const pos = computeSpawnPosition(p.id, PLAYER_SPAWN_NEAR_MIN_DIST, PLAYER_SPAWN_NEAR_MAX_DIST);
+                p.x = pos.x;
+                p.y = pos.y;
+                broadcast({
+                    type: 'PLAYER_RESPAWNED',
+                    playerId: p.id,
+                    x: p.x,
+                    y: p.y,
+                    health: p.health
+                });
+            }
+            return;
         }
-    }, 400);
+
+        if (p.health < MAX_HEALTH && now - p.lastDamageTime >= HEALTH_REGEN_DELAY_MS) {
+            const regenAmount = HEALTH_REGEN_PER_SECOND / TICK_RATE;
+            p.health = Math.min(MAX_HEALTH, p.health + regenAmount);
+        }
+    });
 }
 
 // ==================== وضعیت کامل بازی (برای هماهنگ‌سازی/اصلاح انحراف) ====================
@@ -259,6 +301,8 @@ function broadcastGameState() {
 function gameTick() {
     gameState.tickCount++;
     const now = Date.now();
+
+    processHealthAndRespawn();
 
     gameState.players.forEach((player) => {
         if (player.ws && player.ws.readyState === WebSocket.OPEN) {
@@ -324,14 +368,14 @@ wss.on('connection', (ws) => {
                 if (gameState.players.size >= MAX_PLAYERS) {
                     ws.send(JSON.stringify({
                         type: 'JOIN_REJECTED',
-                        reason: 'ظرفیت سرور تکمیل است (حداکثر ۵ بازیکن)'
+                        reason: 'ظرفیت سرور تکمیل است (حداکثر ۲ بازیکن)'
                     }));
                     ws.close(1008, 'Server full');
                     return;
                 }
 
                 playerId = gameState.nextPlayerId++;
-                const spawnPos = spawnPositionForNewPlayer();
+                const spawnPos = computeSpawnPosition(null, PLAYER_SPAWN_NEAR_MIN_DIST, PLAYER_SPAWN_NEAR_MAX_DIST);
                 const player = new Player(playerId, ws, data.name, spawnPos);
                 gameState.players.set(playerId, player);
 
@@ -364,7 +408,7 @@ wss.on('connection', (ws) => {
             case 'COLLECT_COIN': {
                 if (playerId === null) return;
                 const player = gameState.players.get(playerId);
-                if (!player) return;
+                if (!player || player.isDead) return;
                 const coinId = Number(data.coinId);
                 if (!Number.isFinite(coinId)) return;
                 tryCollectCoin(player, coinId);
@@ -375,7 +419,10 @@ wss.on('connection', (ws) => {
                 if (playerId === null) return;
                 const player = gameState.players.get(playerId);
                 if (!player) return;
-                tryAttack(player);
+                const targetIdRaw = data.targetId;
+                const targetId = (targetIdRaw !== undefined && targetIdRaw !== null) ? Number(targetIdRaw) : null;
+                const attackType = typeof data.attackType === 'string' ? data.attackType.slice(0, 20) : 'front';
+                tryAttack(player, Number.isFinite(targetId) ? targetId : null, attackType);
                 break;
             }
 
