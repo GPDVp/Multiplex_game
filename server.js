@@ -5,21 +5,33 @@ const http = require('http');
 // ==================== تنظیمات کلی ====================
 const PORT = process.env.PORT || 7000;
 const MAX_PLAYERS = 5;
-const MAP_WIDTH = 800;
-const MAP_HEIGHT = 600;
 const TICK_RATE = 30;                       // تعداد تیک سرور در ثانیه
 const PING_INTERVAL = 5000;                 // فاصله پینگ/heartbeat سرور (ms)
-const STATE_BROADCAST_EVERY_N_TICKS = 15;   // پخش وضعیت کامل برای هماهنگ‌سازی (~هر نیم ثانیه)
+const STATE_BROADCAST_EVERY_N_TICKS = 15;   // پخش وضعیت کامل برای هماهنگی (~هر نیم ثانیه)
+
+// نقشه نامحدود است — هیچ محدودیتی برای x/y وجود ندارد.
+// بازیکنان و سکه‌ها همیشه نسبت به بازیکنان فعلی (نه یک جعبه‌ی ثابت) موقعیت‌دهی می‌شوند.
 
 // تنظیمات سکه‌ها
-const MAX_COINS = 10;                       // حداکثر تعداد سکه هم‌زمان روی نقشه
-const COIN_MIN_SPAWN_MS = 1200;             // کمترین فاصله زمانی بین ظاهر شدن سکه‌ها
-const COIN_MAX_SPAWN_MS = 2800;             // بیشترین فاصله زمانی (ظاهر شدن شانسی)
-const COIN_PADDING = 40;                    // فاصله از لبه نقشه تا محل سکه
-const COIN_BONUS_CHANCE = 0.15;             // احتمال سکه‌ی جایزه
+const MAX_COINS = 10;
+const COIN_MIN_SPAWN_MS = 1200;
+const COIN_MAX_SPAWN_MS = 2800;
+const COIN_NEAR_MIN_DIST = 120;             // حداقل فاصله‌ی سکه از بازیکن مرجع
+const COIN_NEAR_MAX_DIST = 320;             // حداکثر فاصله (فاصله‌ی نسبتاً زیاد طبق درخواست)
+const COIN_BONUS_CHANCE = 0.15;
 const COIN_NORMAL_VALUE = 1;
 const COIN_BONUS_VALUE = 5;
 const COLLECT_TOLERANCE = 50;               // شعاع مجاز جمع‌آوری سکه در سرور (px)
+
+// تنظیمات اسپاون بازیکن (بازیکنان نزدیک هم ظاهر می‌شوند)
+const PLAYER_SPAWN_NEAR_MIN_DIST = 70;
+const PLAYER_SPAWN_NEAR_MAX_DIST = 160;
+
+// تنظیمات سلامتی و ضربه
+const MAX_HEALTH = 100;
+const ATTACK_DAMAGE = 20;
+const ATTACK_RANGE = 75;                    // شعاع مؤثر ضربه (باید با اندازه AttackArea کلاینت هم‌خوان باشد)
+const ATTACK_COOLDOWN_MS = 600;
 
 // ==================== وضعیت بازی ====================
 const gameState = {
@@ -32,13 +44,15 @@ const gameState = {
 
 // ==================== کلاس بازیکن ====================
 class Player {
-    constructor(id, ws, name) {
+    constructor(id, ws, name, spawnPos) {
         this.id = id;
         this.ws = ws;
         this.name = (name || `Player${id}`).toString().trim().slice(0, 20) || `Player${id}`;
-        this.x = MAP_WIDTH / 2 + (Math.random() * 120 - 60);
-        this.y = MAP_HEIGHT / 2 + (Math.random() * 120 - 60);
+        this.x = spawnPos.x;
+        this.y = spawnPos.y;
         this.score = 0;
+        this.health = MAX_HEALTH;
+        this.lastAttackTime = 0;
         this.lastUpdate = Date.now();
         this.lastPing = Date.now();
         this.ping = 0;
@@ -51,6 +65,7 @@ class Player {
             x: Math.round(this.x * 100) / 100,
             y: Math.round(this.y * 100) / 100,
             score: this.score,
+            health: this.health,
             ping: this.ping
         };
     }
@@ -71,8 +86,8 @@ class Player {
         if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
             return false;
         }
-        this.x = Math.max(0, Math.min(MAP_WIDTH, x));
-        this.y = Math.max(0, Math.min(MAP_HEIGHT, y));
+        this.x = x;
+        this.y = y;
         this.lastUpdate = Date.now();
         return true;
     }
@@ -88,18 +103,39 @@ function broadcast(data, excludeId = null) {
     });
 }
 
-// ==================== مدیریت سکه‌ها ====================
-function randomCoinPosition() {
-    return {
-        x: COIN_PADDING + Math.random() * (MAP_WIDTH - COIN_PADDING * 2),
-        y: COIN_PADDING + Math.random() * (MAP_HEIGHT - COIN_PADDING * 2)
-    };
+// ==================== موقعیت‌دهی نسبی به بازیکنان فعلی (چون نقشه نامحدود است) ====================
+function pickRandomExistingPlayer() {
+    if (gameState.players.size === 0) return null;
+    const arr = Array.from(gameState.players.values());
+    return arr[Math.floor(Math.random() * arr.length)];
 }
 
+function randomOffset(minDist, maxDist) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = minDist + Math.random() * (maxDist - minDist);
+    return { x: Math.cos(angle) * dist, y: Math.sin(angle) * dist };
+}
+
+function spawnPositionForNewPlayer() {
+    const ref = pickRandomExistingPlayer();
+    if (!ref) return { x: 0, y: 0 }; // اولین بازیکن، مبدأ دنیای بازی
+    const off = randomOffset(PLAYER_SPAWN_NEAR_MIN_DIST, PLAYER_SPAWN_NEAR_MAX_DIST);
+    return { x: ref.x + off.x, y: ref.y + off.y };
+}
+
+function spawnPositionForCoin() {
+    const ref = pickRandomExistingPlayer();
+    if (!ref) return { x: 0, y: 0 };
+    const off = randomOffset(COIN_NEAR_MIN_DIST, COIN_NEAR_MAX_DIST);
+    return { x: ref.x + off.x, y: ref.y + off.y };
+}
+
+// ==================== مدیریت سکه‌ها ====================
 function spawnCoin() {
     if (gameState.coins.size >= MAX_COINS) return;
+    if (gameState.players.size === 0) return; // بدون بازیکن، سکه لازم نیست ظاهر شود
 
-    const pos = randomCoinPosition();
+    const pos = spawnPositionForCoin();
     const isBonus = Math.random() < COIN_BONUS_CHANCE;
     const coin = {
         id: gameState.nextCoinId++,
@@ -112,7 +148,6 @@ function spawnCoin() {
     broadcast({ type: 'COIN_SPAWNED', coin });
 }
 
-// ظاهر شدن سکه‌ها با فاصله‌ی زمانی شانسی (نه ثابت) تا حس طبیعی‌تری داشته باشد
 function scheduleCoinSpawn() {
     const delay = COIN_MIN_SPAWN_MS + Math.random() * (COIN_MAX_SPAWN_MS - COIN_MIN_SPAWN_MS);
     setTimeout(() => {
@@ -123,12 +158,12 @@ function scheduleCoinSpawn() {
 
 function tryCollectCoin(player, coinId) {
     const coin = gameState.coins.get(coinId);
-    if (!coin) return; // یا قبلا جمع شده یا اصلا وجود ندارد
+    if (!coin) return;
 
     const dx = player.x - coin.x;
     const dy = player.y - coin.y;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist > COLLECT_TOLERANCE) return; // خیلی دور است، درخواست نامعتبر
+    if (dist > COLLECT_TOLERANCE) return;
 
     gameState.coins.delete(coinId);
     player.score += coin.value;
@@ -141,6 +176,73 @@ function tryCollectCoin(player, coinId) {
         value: coin.value,
         score: player.score
     });
+}
+
+// ==================== سیستم ضربه و سلامتی ====================
+function tryAttack(attacker) {
+    const now = Date.now();
+    if (now - attacker.lastAttackTime < ATTACK_COOLDOWN_MS) return;
+    attacker.lastAttackTime = now;
+
+    let target = null;
+    let bestDist = Infinity;
+
+    gameState.players.forEach((p) => {
+        if (p.id === attacker.id) return;
+        const dx = p.x - attacker.x;
+        const dy = p.y - attacker.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist <= ATTACK_RANGE && dist < bestDist) {
+            bestDist = dist;
+            target = p;
+        }
+    });
+
+    if (!target) {
+        // ضربه به هوا خورده؛ فقط انیمیشن حمله برای بقیه پخش شود
+        broadcast({
+            type: 'PLAYER_ATTACKED',
+            attackerId: attacker.id,
+            targetId: null,
+            attackerX: attacker.x,
+            attackerY: attacker.y
+        });
+        return;
+    }
+
+    target.health = Math.max(0, target.health - ATTACK_DAMAGE);
+
+    broadcast({
+        type: 'PLAYER_ATTACKED',
+        attackerId: attacker.id,
+        targetId: target.id,
+        targetHealth: target.health,
+        attackerX: attacker.x,
+        attackerY: attacker.y,
+        targetX: target.x,
+        targetY: target.y
+    });
+
+    if (target.health <= 0) {
+        defeatPlayer(target);
+    }
+}
+
+function defeatPlayer(player) {
+    gameState.players.delete(player.id);
+
+    // به بقیه اطلاع بده که این بازیکن از بازی حذف شد (بدون ارسال به خود بازیکن باخته)
+    broadcast({ type: 'PLAYER_DEFEATED', playerId: player.id }, player.id);
+
+    // به خود بازیکن باخته پیام اختصاصی بده
+    player.send({ type: 'YOU_LOST', message: 'شما باختید! حریف شما را شکست داد.' });
+
+    // کمی مهلت برای رسیدن پیام، سپس اتصال را تمیز ببند تا کلاینت وارد چرخه‌ی «بازی دوباره» شود
+    setTimeout(() => {
+        if (player.ws && player.ws.readyState === WebSocket.OPEN) {
+            player.ws.close(1000, 'defeated');
+        }
+    }, 400);
 }
 
 // ==================== وضعیت کامل بازی (برای هماهنگ‌سازی/اصلاح انحراف) ====================
@@ -229,7 +331,8 @@ wss.on('connection', (ws) => {
                 }
 
                 playerId = gameState.nextPlayerId++;
-                const player = new Player(playerId, ws, data.name);
+                const spawnPos = spawnPositionForNewPlayer();
+                const player = new Player(playerId, ws, data.name, spawnPos);
                 gameState.players.set(playerId, player);
 
                 player.send({
@@ -238,10 +341,9 @@ wss.on('connection', (ws) => {
                     name: player.name,
                     x: player.x,
                     y: player.y,
+                    health: player.health,
                     players: Array.from(gameState.players.values()).map(p => p.toJSON()),
                     coins: Array.from(gameState.coins.values()),
-                    mapWidth: MAP_WIDTH,
-                    mapHeight: MAP_HEIGHT,
                     maxPlayers: MAX_PLAYERS
                 });
 
@@ -266,6 +368,14 @@ wss.on('connection', (ws) => {
                 const coinId = Number(data.coinId);
                 if (!Number.isFinite(coinId)) return;
                 tryCollectCoin(player, coinId);
+                break;
+            }
+
+            case 'ATTACK': {
+                if (playerId === null) return;
+                const player = gameState.players.get(playerId);
+                if (!player) return;
+                tryAttack(player);
                 break;
             }
 
@@ -322,8 +432,6 @@ process.on('uncaughtException', (err) => console.error('Uncaught exception:', er
 process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
 
 server.listen(PORT, () => {
-    console.log(`🚀 سرور بازی روی پورت ${PORT} اجرا شد (ظرفیت: ${MAX_PLAYERS} بازیکن)`);
-    // چند سکه اولیه تا دنیای بازی از همان ابتدا خالی نباشد
-    for (let i = 0; i < 4; i++) spawnCoin();
+    console.log(`🚀 سرور بازی روی پورت ${PORT} اجرا شد (ظرفیت: ${MAX_PLAYERS} بازیکن، نقشه‌ی نامحدود)`);
     scheduleCoinSpawn();
 });
