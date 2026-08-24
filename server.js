@@ -4,45 +4,37 @@ const http = require('http');
 
 // ==================== تنظیمات کلی ====================
 const PORT = process.env.PORT || 7000;
-const MAX_PLAYERS = 2;                      // برای روان و سریع بودن، فقط ۲ بازیکن (مبارزه‌ی رودررو)
+const MAX_PLAYERS = 2;                      // مبارزه‌ی رودررو، برای سرعت و روانی بیشتر
 const TICK_RATE = 30;                       // تعداد تیک سرور در ثانیه
 const PING_INTERVAL = 5000;                 // فاصله پینگ/heartbeat سرور (ms)
 const STATE_BROADCAST_EVERY_N_TICKS = 15;   // پخش وضعیت کامل برای هماهنگی (~هر نیم ثانیه)
 
-// نقشه نامحدود است — هیچ محدودیتی برای x/y وجود ندارد.
-// بازیکنان و سکه‌ها همیشه نسبت به بازیکنان فعلیِ زنده (نه یک جعبه‌ی ثابت) موقعیت‌دهی می‌شوند.
-
-// تنظیمات سکه‌ها
-const MAX_COINS = 10;
-const COIN_MIN_SPAWN_MS = 1200;
-const COIN_MAX_SPAWN_MS = 2800;
-const COIN_NEAR_MIN_DIST = 150;
-const COIN_NEAR_MAX_DIST = 350;
-const COIN_BONUS_CHANCE = 0.15;
-const COIN_NORMAL_VALUE = 1;
-const COIN_BONUS_VALUE = 5;
-const COLLECT_TOLERANCE = 50;               // شعاع مجاز جمع‌آوری سکه در سرور (px)
-
-// تنظیمات اسپاون بازیکن (بازیکنان نزدیک هم ظاهر می‌شوند)
+// نقشه نامحدود است — بازیکنان همیشه نسبت به بازیکن زنده‌ی دیگر (نه یک جعبه‌ی ثابت) موقعیت می‌گیرند.
 const PLAYER_SPAWN_NEAR_MIN_DIST = 120;
 const PLAYER_SPAWN_NEAR_MAX_DIST = 220;
 
-// تنظیمات سلامتی، ضربه، ترمیم و بازگشت به بازی
+// تنظیمات سلامتی، ترمیم و بازگشت به بازی
 const MAX_HEALTH = 100;
-const ATTACK_DAMAGE = 20;
-const ATTACK_RANGE = 130;                   // بازه‌ی تایید سرور (سخاوتمندانه)؛ تشخیص اصلیِ هدف با AttackArea خودِ کلاینت است
 const ATTACK_COOLDOWN_MS = 500;             // باید با attack_cooldown اسکریپت کلاینت (0.5s) هماهنگ باشد
 const HEALTH_REGEN_DELAY_MS = 5000;         // بعد از این مدت بدون آسیب دیدن، ترمیم آرام شروع می‌شود
 const HEALTH_REGEN_PER_SECOND = 15;         // سرعت ترمیم تدریجی سلامتی (نه یکباره)
 const RESPAWN_DELAY_MS = 5000;              // بعد از باخت، این مدت بعد به‌طور خودکار به بازی برمی‌گردد
 
+// دمیج هر ضربه دیگر اینجا تعریف نمی‌شود — طبق درخواست، کاملاً از مقداری که خودِ کلاینت
+// (از متغیرهای قابل‌تنظیم در Player.gd) می‌فرستد استفاده می‌شود؛ سرور فقط عدد را معتبر
+// (مثبت، محدود به حداکثر سلامتی) می‌کند تا خطا/کرش ایجاد نشود — این اعتبارسنجی، ضدتقلب نیست.
+const MAX_SINGLE_HIT_DAMAGE = MAX_HEALTH;
+
+// ==================== تنظیمات دور بازی ====================
+const ROUND_DURATION_MS = 2 * 60 * 1000;    // ۲ دقیقه
+
 // ==================== وضعیت بازی ====================
 const gameState = {
     players: new Map(),   // playerId -> Player
-    coins: new Map(),     // coinId   -> {id,x,y,value}
     nextPlayerId: 1,
-    nextCoinId: 1,
-    tickCount: 0
+    tickCount: 0,
+    roundActive: true,
+    roundEndsAt: Date.now() + ROUND_DURATION_MS
 };
 
 // ==================== کلاس بازیکن ====================
@@ -53,10 +45,10 @@ class Player {
         this.name = (name || `Player${id}`).toString().trim().slice(0, 20) || `Player${id}`;
         this.x = spawnPos.x;
         this.y = spawnPos.y;
-        this.score = 0;
         this.health = MAX_HEALTH;           // به‌صورت داخلی float نگه داشته می‌شود تا ترمیم کاملاً نرم باشد
         this.isDead = false;
         this.deadUntil = 0;
+        this.armRotation = 0;               // فقط جنبه‌ی نمایشی (چرخش بازوها) — بدون اثر در منطق بازی
         this.lastAttackTime = 0;
         this.lastDamageTime = 0;
         this.lastUpdate = Date.now();
@@ -70,9 +62,9 @@ class Player {
             name: this.name,
             x: Math.round(this.x * 100) / 100,
             y: Math.round(this.y * 100) / 100,
-            score: this.score,
             health: Math.round(this.health),
             isDead: this.isDead,
+            armRotation: Math.round(this.armRotation * 1000) / 1000,
             ping: this.ping
         };
     }
@@ -89,13 +81,16 @@ class Player {
         return false;
     }
 
-    updatePosition(x, y) {
+    updatePosition(x, y, armRotation) {
         if (this.isDead) return false;
         if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
             return false;
         }
         this.x = x;
         this.y = y;
+        if (typeof armRotation === 'number' && isFinite(armRotation)) {
+            this.armRotation = armRotation;
+        }
         this.lastUpdate = Date.now();
         return true;
     }
@@ -126,98 +121,28 @@ function randomOffset(minDist, maxDist) {
 
 function computeSpawnPosition(excludeId, minDist, maxDist) {
     const ref = pickRandomExistingPlayer(excludeId);
-    if (!ref) return { x: 0, y: 0 }; // اولین بازیکن یا بدون بازیکن زنده‌ی دیگر
+    if (!ref) return { x: 0, y: 0 };
     const off = randomOffset(minDist, maxDist);
     return { x: ref.x + off.x, y: ref.y + off.y };
 }
 
-// ==================== مدیریت سکه‌ها ====================
-function spawnCoin() {
-    if (gameState.coins.size >= MAX_COINS) return;
-    if (gameState.players.size === 0) return;
-
-    const pos = computeSpawnPosition(null, COIN_NEAR_MIN_DIST, COIN_NEAR_MAX_DIST);
-    const isBonus = Math.random() < COIN_BONUS_CHANCE;
-    const coin = {
-        id: gameState.nextCoinId++,
-        x: Math.round(pos.x * 100) / 100,
-        y: Math.round(pos.y * 100) / 100,
-        value: isBonus ? COIN_BONUS_VALUE : COIN_NORMAL_VALUE
-    };
-
-    gameState.coins.set(coin.id, coin);
-    broadcast({ type: 'COIN_SPAWNED', coin });
-}
-
-function scheduleCoinSpawn() {
-    const delay = COIN_MIN_SPAWN_MS + Math.random() * (COIN_MAX_SPAWN_MS - COIN_MIN_SPAWN_MS);
-    setTimeout(() => {
-        spawnCoin();
-        scheduleCoinSpawn();
-    }, delay);
-}
-
-function tryCollectCoin(player, coinId) {
-    const coin = gameState.coins.get(coinId);
-    if (!coin) return;
-
-    const dx = player.x - coin.x;
-    const dy = player.y - coin.y;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist > COLLECT_TOLERANCE) return;
-
-    gameState.coins.delete(coinId);
-    player.score += coin.value;
-
-    broadcast({
-        type: 'COIN_COLLECTED',
-        coinId: coin.id,
-        playerId: player.id,
-        playerName: player.name,
-        value: coin.value,
-        score: player.score
-    });
-}
-
 // ==================== سیستم ضربه ====================
-function tryAttack(attacker, requestedTargetId, attackType) {
+// طبق درخواست صریح شما: هیچ اعتبارسنجی فاصله‌ی پیکسلی و هیچ جدول دمیج ثابتی روی سرور
+// وجود ندارد — تشخیص هدف کاملاً بر عهده‌ی AttackArea‌ای است که خودتان در ادیتور روی
+// صحنه‌ی بازیکن تنظیم کرده‌اید، و مقدار دمیج هم دقیقاً همانی است که از متغیرهای
+// قابل‌تنظیم در خودِ Player.gd شما ارسال می‌شود. سرور فقط این دو کار پایه (نه ضدتقلب) را
+// انجام می‌دهد: (۱) هدف واقعاً وجود دارد/زنده است/خودِ حمله‌کننده نیست، (۲) عدد دمیج
+// معتبر است (مثبت و محدود) تا از کرش/NaN جلوگیری شود.
+function tryAttack(attacker, requestedTargetId, attackType, rawDamage) {
+    if (!gameState.roundActive) return;
     if (attacker.isDead) return;
 
     const now = Date.now();
     if (now - attacker.lastAttackTime < ATTACK_COOLDOWN_MS) return;
     attacker.lastAttackTime = now;
 
-    let target = null;
-
-    // اولویت با هدفی است که خودِ کلاینت (با AttackArea داخل بازی) تشخیص داده
-    if (requestedTargetId !== null && requestedTargetId !== undefined) {
-        const candidate = gameState.players.get(requestedTargetId);
-        if (candidate && candidate.id !== attacker.id && !candidate.isDead) {
-            const dx = candidate.x - attacker.x;
-            const dy = candidate.y - attacker.y;
-            if (Math.sqrt(dx * dx + dy * dy) <= ATTACK_RANGE) {
-                target = candidate;
-            }
-        }
-    }
-
-    // در نبود هدف معتبر، نزدیک‌ترین بازیکنِ زنده‌ی داخل برد به‌عنوان جایگزین
-    if (!target) {
-        let bestDist = Infinity;
-        gameState.players.forEach((p) => {
-            if (p.id === attacker.id || p.isDead) return;
-            const dx = p.x - attacker.x;
-            const dy = p.y - attacker.y;
-            const dist = Math.sqrt(dx * dx + dy * dy);
-            if (dist <= ATTACK_RANGE && dist < bestDist) {
-                bestDist = dist;
-                target = p;
-            }
-        });
-    }
-
-    if (!target) {
-        // ضربه به هوا خورده؛ فقط انیمیشن حمله برای بقیه پخش شود
+    if (requestedTargetId === null || requestedTargetId === undefined) {
+        // ضربه به هوا خورده (کسی داخل AttackArea نبوده)؛ فقط انیمیشن برای بقیه پخش شود
         broadcast({
             type: 'PLAYER_ATTACKED',
             attackerId: attacker.id,
@@ -229,7 +154,16 @@ function tryAttack(attacker, requestedTargetId, attackType) {
         return;
     }
 
-    target.health = Math.max(0, target.health - ATTACK_DAMAGE);
+    const target = gameState.players.get(requestedTargetId);
+    if (!target || target.id === attacker.id || target.isDead) {
+        return;
+    }
+
+    let damage = Number(rawDamage);
+    if (!Number.isFinite(damage) || damage <= 0) damage = 0;
+    damage = Math.min(damage, MAX_SINGLE_HIT_DAMAGE);
+
+    target.health = Math.max(0, target.health - damage);
     target.lastDamageTime = now;
 
     broadcast({
@@ -237,6 +171,7 @@ function tryAttack(attacker, requestedTargetId, attackType) {
         attackerId: attacker.id,
         targetId: target.id,
         attackType,
+        damage,
         targetHealth: Math.round(target.health),
         attackerX: attacker.x,
         attackerY: attacker.y,
@@ -287,12 +222,53 @@ function processHealthAndRespawn() {
     });
 }
 
+// ==================== دور بازی (۲ دقیقه‌ای) ====================
+function getRoundTimeRemainingSeconds() {
+    if (!gameState.roundActive) return 0;
+    return Math.max(0, (gameState.roundEndsAt - Date.now()) / 1000);
+}
+
+function startNewRound() {
+    gameState.roundActive = true;
+    gameState.roundEndsAt = Date.now() + ROUND_DURATION_MS;
+
+    const playersArr = Array.from(gameState.players.values());
+    playersArr.forEach((p) => {
+        p.isDead = false;
+        p.health = MAX_HEALTH;
+        p.lastDamageTime = Date.now();
+    });
+    playersArr.forEach((p) => {
+        const pos = computeSpawnPosition(p.id, PLAYER_SPAWN_NEAR_MIN_DIST, PLAYER_SPAWN_NEAR_MAX_DIST);
+        p.x = pos.x;
+        p.y = pos.y;
+    });
+
+    broadcast({
+        type: 'ROUND_STARTED',
+        durationMs: ROUND_DURATION_MS,
+        players: playersArr.map(p => p.toJSON())
+    });
+}
+
+function endRound() {
+    gameState.roundActive = false;
+    broadcast({ type: 'ROUND_ENDED' });
+}
+
+function checkRoundEnd() {
+    if (gameState.roundActive && Date.now() >= gameState.roundEndsAt) {
+        endRound();
+    }
+}
+
 // ==================== وضعیت کامل بازی (برای هماهنگ‌سازی/اصلاح انحراف) ====================
 function broadcastGameState() {
     broadcast({
         type: 'GAME_STATE',
         players: Array.from(gameState.players.values()).map(p => p.toJSON()),
-        coins: Array.from(gameState.coins.values()),
+        roundActive: gameState.roundActive,
+        roundTimeRemaining: getRoundTimeRemainingSeconds(),
         timestamp: Date.now()
     });
 }
@@ -303,6 +279,7 @@ function gameTick() {
     const now = Date.now();
 
     processHealthAndRespawn();
+    checkRoundEnd();
 
     gameState.players.forEach((player) => {
         if (player.ws && player.ws.readyState === WebSocket.OPEN) {
@@ -330,7 +307,8 @@ app.get('/health', (req, res) => {
         status: 'OK',
         players: gameState.players.size,
         maxPlayers: MAX_PLAYERS,
-        coins: gameState.coins.size,
+        roundActive: gameState.roundActive,
+        roundTimeRemaining: getRoundTimeRemainingSeconds(),
         uptime: process.uptime()
     });
 });
@@ -338,9 +316,10 @@ app.get('/health', (req, res) => {
 app.get('/status', (req, res) => {
     res.json({
         players: Array.from(gameState.players.values()).map(p => p.toJSON()),
-        coins: Array.from(gameState.coins.values()),
         totalPlayers: gameState.players.size,
         maxPlayers: MAX_PLAYERS,
+        roundActive: gameState.roundActive,
+        roundTimeRemaining: getRoundTimeRemainingSeconds(),
         tick: gameState.tickCount
     });
 });
@@ -386,8 +365,9 @@ wss.on('connection', (ws) => {
                     x: player.x,
                     y: player.y,
                     health: player.health,
+                    roundActive: gameState.roundActive,
+                    roundTimeRemaining: getRoundTimeRemainingSeconds(),
                     players: Array.from(gameState.players.values()).map(p => p.toJSON()),
-                    coins: Array.from(gameState.coins.values()),
                     maxPlayers: MAX_PLAYERS
                 });
 
@@ -397,21 +377,18 @@ wss.on('connection', (ws) => {
 
             case 'MOVE': {
                 if (playerId === null) return;
+                if (!gameState.roundActive) return;
                 const player = gameState.players.get(playerId);
                 if (!player) return;
-                if (player.updatePosition(data.x, data.y)) {
-                    broadcast({ type: 'PLAYER_MOVED', playerId: player.id, x: player.x, y: player.y }, playerId);
+                if (player.updatePosition(data.x, data.y, data.armRotation)) {
+                    broadcast({
+                        type: 'PLAYER_MOVED',
+                        playerId: player.id,
+                        x: player.x,
+                        y: player.y,
+                        armRotation: player.armRotation
+                    }, playerId);
                 }
-                break;
-            }
-
-            case 'COLLECT_COIN': {
-                if (playerId === null) return;
-                const player = gameState.players.get(playerId);
-                if (!player || player.isDead) return;
-                const coinId = Number(data.coinId);
-                if (!Number.isFinite(coinId)) return;
-                tryCollectCoin(player, coinId);
                 break;
             }
 
@@ -422,7 +399,14 @@ wss.on('connection', (ws) => {
                 const targetIdRaw = data.targetId;
                 const targetId = (targetIdRaw !== undefined && targetIdRaw !== null) ? Number(targetIdRaw) : null;
                 const attackType = typeof data.attackType === 'string' ? data.attackType.slice(0, 20) : 'front';
-                tryAttack(player, Number.isFinite(targetId) ? targetId : null, attackType);
+                tryAttack(player, Number.isFinite(targetId) ? targetId : null, attackType, data.damage);
+                break;
+            }
+
+            case 'RESTART_ROUND': {
+                if (playerId === null) return;
+                if (gameState.roundActive) return; // دوری در حال اجراست، نیازی به شروع مجدد نیست
+                startNewRound();
                 break;
             }
 
@@ -479,6 +463,5 @@ process.on('uncaughtException', (err) => console.error('Uncaught exception:', er
 process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
 
 server.listen(PORT, () => {
-    console.log(`🚀 سرور بازی روی پورت ${PORT} اجرا شد (ظرفیت: ${MAX_PLAYERS} بازیکن، نقشه‌ی نامحدود)`);
-    scheduleCoinSpawn();
+    console.log(`🚀 سرور بازی روی پورت ${PORT} اجرا شد (ظرفیت: ${MAX_PLAYERS} بازیکن، دور ${ROUND_DURATION_MS / 60000} دقیقه‌ای)`);
 });
