@@ -49,6 +49,7 @@ class Player {
         this.isDead = false;
         this.deadUntil = 0;
         this.armRotation = 0;               // فقط جنبه‌ی نمایشی (چرخش بازوها) — بدون اثر در منطق بازی
+        this.isSliding = false;             // فقط جنبه‌ی نمایشی (افکت ذرات اسلاید) — بدون اثر در منطق بازی
         this.lastAttackTime = 0;
         this.lastDamageTime = 0;
         this.lastUpdate = Date.now();
@@ -65,6 +66,7 @@ class Player {
             health: Math.round(this.health),
             isDead: this.isDead,
             armRotation: Math.round(this.armRotation * 1000) / 1000,
+            sliding: this.isSliding,
             ping: this.ping
         };
     }
@@ -81,7 +83,7 @@ class Player {
         return false;
     }
 
-    updatePosition(x, y, armRotation) {
+    updatePosition(x, y, armRotation, sliding) {
         if (this.isDead) return false;
         if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
             return false;
@@ -91,6 +93,7 @@ class Player {
         if (typeof armRotation === 'number' && isFinite(armRotation)) {
             this.armRotation = armRotation;
         }
+        this.isSliding = !!sliding;
         this.lastUpdate = Date.now();
         return true;
     }
@@ -380,13 +383,14 @@ wss.on('connection', (ws) => {
                 if (!gameState.roundActive) return;
                 const player = gameState.players.get(playerId);
                 if (!player) return;
-                if (player.updatePosition(data.x, data.y, data.armRotation)) {
+                if (player.updatePosition(data.x, data.y, data.armRotation, data.sliding)) {
                     broadcast({
                         type: 'PLAYER_MOVED',
                         playerId: player.id,
                         x: player.x,
                         y: player.y,
-                        armRotation: player.armRotation
+                        armRotation: player.armRotation,
+                        sliding: player.isSliding
                     }, playerId);
                 }
                 break;
