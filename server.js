@@ -4,52 +4,75 @@ const http = require('http');
 
 // ==================== تنظیمات کلی ====================
 const PORT = process.env.PORT || 7000;
-const MAX_PLAYERS = 2;                      // مبارزه‌ی رودررو، برای سرعت و روانی بیشتر
+const MAX_PLAYERS_PER_ROOM = 2;             // هر روم دقیقاً یک مبارزه‌ی رودررو است
 const TICK_RATE = 30;                       // تعداد تیک سرور در ثانیه
 const PING_INTERVAL = 5000;                 // فاصله پینگ/heartbeat سرور (ms)
 const STATE_BROADCAST_EVERY_N_TICKS = 15;   // پخش وضعیت کامل برای هماهنگی (~هر نیم ثانیه)
 
-// نقشه نامحدود است — بازیکنان همیشه نسبت به بازیکن زنده‌ی دیگر (نه یک جعبه‌ی ثابت) موقعیت می‌گیرند.
 const PLAYER_SPAWN_NEAR_MIN_DIST = 120;
 const PLAYER_SPAWN_NEAR_MAX_DIST = 220;
 
-// تنظیمات سلامتی، ترمیم و بازگشت به بازی
 const MAX_HEALTH = 100;
 const ATTACK_COOLDOWN_MS = 500;             // باید با attack_cooldown اسکریپت کلاینت (0.5s) هماهنگ باشد
 const HEALTH_REGEN_DELAY_MS = 5000;         // بعد از این مدت بدون آسیب دیدن، ترمیم آرام شروع می‌شود
 const HEALTH_REGEN_PER_SECOND = 15;         // سرعت ترمیم تدریجی سلامتی (نه یکباره)
-const RESPAWN_DELAY_MS = 5000;              // بعد از باخت، این مدت بعد به‌طور خودکار به بازی برمی‌گردد
+const MAX_SINGLE_HIT_DAMAGE = MAX_HEALTH;   // فقط اعتبارسنجی پایه (نه ضدتقلب) تا عدد نامعتبر کرش نکند
 
-// دمیج هر ضربه دیگر اینجا تعریف نمی‌شود — طبق درخواست، کاملاً از مقداری که خودِ کلاینت
-// (از متغیرهای قابل‌تنظیم در Player.gd) می‌فرستد استفاده می‌شود؛ سرور فقط عدد را معتبر
-// (مثبت، محدود به حداکثر سلامتی) می‌کند تا خطا/کرش ایجاد نشود — این اعتبارسنجی، ضدتقلب نیست.
-const MAX_SINGLE_HIT_DAMAGE = MAX_HEALTH;
+const ROUND_DURATION_MS = 4 * 60 * 1000;    // ۴ دقیقه
 
-// ==================== تنظیمات دور بازی ====================
-const ROUND_DURATION_MS = 2 * 60 * 1000;    // ۲ دقیقه
+// ==================== مدیریت روم‌ها (matchmaking خودکار ۲نفره) ====================
+// هر بار کسی JOIN می‌فرستد: اگر یک روم با دقیقاً ۱ بازیکن منتظر وجود داشته باشد،
+// به همان اضافه می‌شود (و بلافاصله دور شروع می‌شود)؛ در غیر این صورت یک روم تازه
+// برایش ساخته می‌شود و منتظر حریف بعدی می‌ماند. هر روم کاملاً مستقل است — نقشه،
+// سلامتی، تایمر دور و پیام‌ها هرگز بین روم‌های مختلف مخلوط نمی‌شوند.
+class Room {
+    constructor(id) {
+        this.id = id;
+        this.players = new Map(); // playerId -> Player
+        this.roundActive = false;
+        this.roundEndsAt = 0;
+    }
+}
 
-// ==================== وضعیت بازی ====================
-const gameState = {
-    players: new Map(),   // playerId -> Player
-    nextPlayerId: 1,
-    tickCount: 0,
-    roundActive: true,
-    roundEndsAt: Date.now() + ROUND_DURATION_MS
-};
+const rooms = new Map(); // roomId -> Room
+let nextRoomId = 1;
+let nextPlayerId = 1;
+let serverTickCount = 0;
+
+function findWaitingRoom() {
+    for (const room of rooms.values()) {
+        if (room.players.size === 1) return room;
+    }
+    return null;
+}
+
+function getOrCreateRoomForNewPlayer() {
+    const waiting = findWaitingRoom();
+    if (waiting) return waiting;
+    const room = new Room(nextRoomId++);
+    rooms.set(room.id, room);
+    return room;
+}
+
+function getRoomTimeRemainingSeconds(room) {
+    if (!room.roundActive) return 0;
+    return Math.max(0, (room.roundEndsAt - Date.now()) / 1000);
+}
 
 // ==================== کلاس بازیکن ====================
 class Player {
     constructor(id, ws, name, spawnPos) {
         this.id = id;
         this.ws = ws;
+        this.room = null;
         this.name = (name || `Player${id}`).toString().trim().slice(0, 20) || `Player${id}`;
         this.x = spawnPos.x;
         this.y = spawnPos.y;
         this.health = MAX_HEALTH;           // به‌صورت داخلی float نگه داشته می‌شود تا ترمیم کاملاً نرم باشد
-        this.isDead = false;
-        this.deadUntil = 0;
-        this.armRotation = 0;               // فقط جنبه‌ی نمایشی (چرخش بازوها) — بدون اثر در منطق بازی
-        this.isSliding = false;             // فقط جنبه‌ی نمایشی (افکت ذرات اسلاید) — بدون اثر در منطق بازی
+        this.armRotation = 0;               // فقط جنبه‌ی نمایشی (چرخش بازوها)
+        this.isSliding = false;             // فقط جنبه‌ی نمایشی (افکت ذرات اسلاید)
+        this.legAnim = 'RESET';             // فقط جنبه‌ی نمایشی (انیمیشن دقیق پا: RESET/run/jump)
+        this.legSpeed = 1.0;                // فقط جنبه‌ی نمایشی (سرعت پخش انیمیشن پا)
         this.lastAttackTime = 0;
         this.lastDamageTime = 0;
         this.lastUpdate = Date.now();
@@ -64,9 +87,10 @@ class Player {
             x: Math.round(this.x * 100) / 100,
             y: Math.round(this.y * 100) / 100,
             health: Math.round(this.health),
-            isDead: this.isDead,
             armRotation: Math.round(this.armRotation * 1000) / 1000,
             sliding: this.isSliding,
+            legAnim: this.legAnim,
+            legSpeed: Math.round(this.legSpeed * 100) / 100,
             ping: this.ping
         };
     }
@@ -83,8 +107,7 @@ class Player {
         return false;
     }
 
-    updatePosition(x, y, armRotation, sliding) {
-        if (this.isDead) return false;
+    updatePosition(x, y, armRotation, sliding, legAnim, legSpeed) {
         if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
             return false;
         }
@@ -94,24 +117,30 @@ class Player {
             this.armRotation = armRotation;
         }
         this.isSliding = !!sliding;
+        if (typeof legAnim === 'string' && legAnim.length > 0 && legAnim.length <= 20) {
+            this.legAnim = legAnim;
+        }
+        if (typeof legSpeed === 'number' && isFinite(legSpeed) && legSpeed > 0) {
+            this.legSpeed = Math.min(legSpeed, 5);
+        }
         this.lastUpdate = Date.now();
         return true;
     }
 }
 
-// ==================== پخش پیام ====================
-function broadcast(data, excludeId = null) {
+// ==================== پخش پیام (فقط داخل همان روم) ====================
+function broadcast(room, data, excludeId = null) {
     const message = JSON.stringify(data);
-    gameState.players.forEach((player, id) => {
+    room.players.forEach((player, id) => {
         if (id !== excludeId && player.ws && player.ws.readyState === WebSocket.OPEN) {
             try { player.ws.send(message); } catch (err) { /* نادیده گرفته می‌شود */ }
         }
     });
 }
 
-// ==================== موقعیت‌دهی نسبی به بازیکنان زنده‌ی فعلی ====================
-function pickRandomExistingPlayer(excludeId) {
-    const arr = Array.from(gameState.players.values()).filter(p => p.id !== excludeId && !p.isDead);
+// ==================== موقعیت‌دهی نسبی به بازیکنِ دیگرِ همان روم ====================
+function pickOtherPlayerInRoom(room, excludeId) {
+    const arr = Array.from(room.players.values()).filter(p => p.id !== excludeId);
     if (arr.length === 0) return null;
     return arr[Math.floor(Math.random() * arr.length)];
 }
@@ -122,8 +151,8 @@ function randomOffset(minDist, maxDist) {
     return { x: Math.cos(angle) * dist, y: Math.sin(angle) * dist };
 }
 
-function computeSpawnPosition(excludeId, minDist, maxDist) {
-    const ref = pickRandomExistingPlayer(excludeId);
+function computeSpawnPosition(room, excludeId, minDist, maxDist) {
+    const ref = pickOtherPlayerInRoom(room, excludeId);
     if (!ref) return { x: 0, y: 0 };
     const off = randomOffset(minDist, maxDist);
     return { x: ref.x + off.x, y: ref.y + off.y };
@@ -133,20 +162,17 @@ function computeSpawnPosition(excludeId, minDist, maxDist) {
 // طبق درخواست صریح شما: هیچ اعتبارسنجی فاصله‌ی پیکسلی و هیچ جدول دمیج ثابتی روی سرور
 // وجود ندارد — تشخیص هدف کاملاً بر عهده‌ی AttackArea‌ای است که خودتان در ادیتور روی
 // صحنه‌ی بازیکن تنظیم کرده‌اید، و مقدار دمیج هم دقیقاً همانی است که از متغیرهای
-// قابل‌تنظیم در خودِ Player.gd شما ارسال می‌شود. سرور فقط این دو کار پایه (نه ضدتقلب) را
-// انجام می‌دهد: (۱) هدف واقعاً وجود دارد/زنده است/خودِ حمله‌کننده نیست، (۲) عدد دمیج
-// معتبر است (مثبت و محدود) تا از کرش/NaN جلوگیری شود.
-function tryAttack(attacker, requestedTargetId, attackType, rawDamage) {
-    if (!gameState.roundActive) return;
-    if (attacker.isDead) return;
+// قابل‌تنظیم در خودِ Player.gd شما ارسال می‌شود.
+function tryAttack(room, attacker, requestedTargetId, attackType, rawDamage) {
+    if (!room.roundActive) return;
 
     const now = Date.now();
     if (now - attacker.lastAttackTime < ATTACK_COOLDOWN_MS) return;
     attacker.lastAttackTime = now;
 
     if (requestedTargetId === null || requestedTargetId === undefined) {
-        // ضربه به هوا خورده (کسی داخل AttackArea نبوده)؛ فقط انیمیشن برای بقیه پخش شود
-        broadcast({
+        // ضربه به هوا خورده (کسی داخل AttackArea نبوده)؛ فقط انیمیشن برای حریف پخش شود
+        broadcast(room, {
             type: 'PLAYER_ATTACKED',
             attackerId: attacker.id,
             targetId: null,
@@ -157,10 +183,10 @@ function tryAttack(attacker, requestedTargetId, attackType, rawDamage) {
         return;
     }
 
-    const target = gameState.players.get(requestedTargetId);
-    if (!target || target.id === attacker.id || target.isDead) {
-        return;
-    }
+    // هدف باید دقیقاً در همین روم باشد — room.players فقط همین ۲ نفر را دارد،
+    // پس جست‌وجو در روم‌های دیگر اصلاً امکان‌پذیر نیست (ایزوله‌سازی خودکار).
+    const target = room.players.get(requestedTargetId);
+    if (!target || target.id === attacker.id) return;
 
     let damage = Number(rawDamage);
     if (!Number.isFinite(damage) || damage <= 0) damage = 0;
@@ -169,7 +195,7 @@ function tryAttack(attacker, requestedTargetId, attackType, rawDamage) {
     target.health = Math.max(0, target.health - damage);
     target.lastDamageTime = now;
 
-    broadcast({
+    broadcast(room, {
         type: 'PLAYER_ATTACKED',
         attackerId: attacker.id,
         targetId: target.id,
@@ -183,41 +209,61 @@ function tryAttack(attacker, requestedTargetId, attackType, rawDamage) {
     });
 
     if (target.health <= 0) {
-        killPlayer(target);
+        endRoundWithWinner(room, attacker, target);
     }
 }
 
-function killPlayer(player) {
-    player.isDead = true;
-    player.health = 0;
-    player.deadUntil = Date.now() + RESPAWN_DELAY_MS;
-    broadcast({ type: 'PLAYER_DIED', playerId: player.id, respawnInMs: RESPAWN_DELAY_MS });
+// ==================== پایان دور با برنده/بازنده مشخص ====================
+function endRoundWithWinner(room, winner, loser) {
+    room.roundActive = false;
+    broadcast(room, {
+        type: 'ROUND_ENDED',
+        reason: 'defeat',
+        winnerId: winner.id,
+        loserId: loser.id
+    });
 }
 
-// ==================== ترمیم تدریجی سلامتی + بازگشت خودکار بعد از باخت ====================
-function processHealthAndRespawn() {
+function endRoundByTimeout(room) {
+    room.roundActive = false;
+    broadcast(room, { type: 'ROUND_ENDED', reason: 'timeout' });
+}
+
+function checkRoundEnd(room) {
+    if (room.roundActive && Date.now() >= room.roundEndsAt) {
+        endRoundByTimeout(room);
+    }
+}
+
+function startNewRound(room) {
+    if (room.players.size < MAX_PLAYERS_PER_ROOM) return; // بدون حریف نمی‌توان دوباره شروع کرد
+
+    room.roundActive = true;
+    room.roundEndsAt = Date.now() + ROUND_DURATION_MS;
+
+    const arr = Array.from(room.players.values());
+    arr.forEach((p) => {
+        p.health = MAX_HEALTH;
+        p.lastDamageTime = Date.now();
+    });
+    arr.forEach((p) => {
+        const pos = computeSpawnPosition(room, p.id, PLAYER_SPAWN_NEAR_MIN_DIST, PLAYER_SPAWN_NEAR_MAX_DIST);
+        p.x = pos.x;
+        p.y = pos.y;
+    });
+
+    broadcast(room, {
+        type: 'ROUND_STARTED',
+        durationMs: ROUND_DURATION_MS,
+        players: arr.map(p => p.toJSON())
+    });
+}
+
+// ==================== ترمیم تدریجی سلامتی (فقط در دور فعال) ====================
+function processHealthRegen(room) {
+    if (!room.roundActive) return;
     const now = Date.now();
-
-    gameState.players.forEach((p) => {
-        if (p.isDead) {
-            if (now >= p.deadUntil) {
-                p.isDead = false;
-                p.health = MAX_HEALTH;
-                p.lastDamageTime = now;
-                const pos = computeSpawnPosition(p.id, PLAYER_SPAWN_NEAR_MIN_DIST, PLAYER_SPAWN_NEAR_MAX_DIST);
-                p.x = pos.x;
-                p.y = pos.y;
-                broadcast({
-                    type: 'PLAYER_RESPAWNED',
-                    playerId: p.id,
-                    x: p.x,
-                    y: p.y,
-                    health: p.health
-                });
-            }
-            return;
-        }
-
+    room.players.forEach((p) => {
         if (p.health < MAX_HEALTH && now - p.lastDamageTime >= HEALTH_REGEN_DELAY_MS) {
             const regenAmount = HEALTH_REGEN_PER_SECOND / TICK_RATE;
             p.health = Math.min(MAX_HEALTH, p.health + regenAmount);
@@ -225,76 +271,42 @@ function processHealthAndRespawn() {
     });
 }
 
-// ==================== دور بازی (۲ دقیقه‌ای) ====================
-function getRoundTimeRemainingSeconds() {
-    if (!gameState.roundActive) return 0;
-    return Math.max(0, (gameState.roundEndsAt - Date.now()) / 1000);
-}
-
-function startNewRound() {
-    gameState.roundActive = true;
-    gameState.roundEndsAt = Date.now() + ROUND_DURATION_MS;
-
-    const playersArr = Array.from(gameState.players.values());
-    playersArr.forEach((p) => {
-        p.isDead = false;
-        p.health = MAX_HEALTH;
-        p.lastDamageTime = Date.now();
-    });
-    playersArr.forEach((p) => {
-        const pos = computeSpawnPosition(p.id, PLAYER_SPAWN_NEAR_MIN_DIST, PLAYER_SPAWN_NEAR_MAX_DIST);
-        p.x = pos.x;
-        p.y = pos.y;
-    });
-
-    broadcast({
-        type: 'ROUND_STARTED',
-        durationMs: ROUND_DURATION_MS,
-        players: playersArr.map(p => p.toJSON())
-    });
-}
-
-function endRound() {
-    gameState.roundActive = false;
-    broadcast({ type: 'ROUND_ENDED' });
-}
-
-function checkRoundEnd() {
-    if (gameState.roundActive && Date.now() >= gameState.roundEndsAt) {
-        endRound();
-    }
-}
-
-// ==================== وضعیت کامل بازی (برای هماهنگ‌سازی/اصلاح انحراف) ====================
-function broadcastGameState() {
-    broadcast({
+// ==================== وضعیت کامل یک روم (برای هماهنگ‌سازی/اصلاح انحراف) ====================
+function broadcastGameState(room) {
+    broadcast(room, {
         type: 'GAME_STATE',
-        players: Array.from(gameState.players.values()).map(p => p.toJSON()),
-        roundActive: gameState.roundActive,
-        roundTimeRemaining: getRoundTimeRemainingSeconds(),
+        players: Array.from(room.players.values()).map(p => p.toJSON()),
+        roundActive: room.roundActive,
+        roundTimeRemaining: getRoomTimeRemainingSeconds(room),
         timestamp: Date.now()
     });
 }
 
-// ==================== تیک اصلی سرور ====================
+// ==================== تیک اصلی سرور (روی همه‌ی روم‌ها) ====================
 function gameTick() {
-    gameState.tickCount++;
+    serverTickCount++;
     const now = Date.now();
 
-    processHealthAndRespawn();
-    checkRoundEnd();
+    rooms.forEach((room) => {
+        processHealthRegen(room);
+        checkRoundEnd(room);
 
-    gameState.players.forEach((player) => {
-        if (player.ws && player.ws.readyState === WebSocket.OPEN) {
-            if (now - player.lastPing > PING_INTERVAL) {
-                player.lastPing = now;
-                player.send({ type: 'PING', timestamp: now });
+        room.players.forEach((player) => {
+            if (player.ws && player.ws.readyState === WebSocket.OPEN) {
+                if (now - player.lastPing > PING_INTERVAL) {
+                    player.lastPing = now;
+                    player.send({ type: 'PING', timestamp: now });
+                }
             }
-        }
+        });
     });
 
-    if (gameState.tickCount % STATE_BROADCAST_EVERY_N_TICKS === 0) {
-        broadcastGameState();
+    if (serverTickCount % STATE_BROADCAST_EVERY_N_TICKS === 0) {
+        rooms.forEach((room) => {
+            if (room.players.size > 0) {
+                broadcastGameState(room);
+            }
+        });
     }
 }
 
@@ -306,29 +318,33 @@ const wss = new WebSocket.Server({ server, perMessageDeflate: false });
 app.use(express.json());
 
 app.get('/health', (req, res) => {
+    let totalPlayers = 0;
+    let activeMatches = 0;
+    rooms.forEach((r) => {
+        totalPlayers += r.players.size;
+        if (r.players.size === MAX_PLAYERS_PER_ROOM) activeMatches++;
+    });
     res.json({
         status: 'OK',
-        players: gameState.players.size,
-        maxPlayers: MAX_PLAYERS,
-        roundActive: gameState.roundActive,
-        roundTimeRemaining: getRoundTimeRemainingSeconds(),
+        totalPlayers,
+        totalRooms: rooms.size,
+        activeMatches,
         uptime: process.uptime()
     });
 });
 
 app.get('/status', (req, res) => {
-    res.json({
-        players: Array.from(gameState.players.values()).map(p => p.toJSON()),
-        totalPlayers: gameState.players.size,
-        maxPlayers: MAX_PLAYERS,
-        roundActive: gameState.roundActive,
-        roundTimeRemaining: getRoundTimeRemainingSeconds(),
-        tick: gameState.tickCount
-    });
+    const roomsInfo = Array.from(rooms.values()).map((r) => ({
+        id: r.id,
+        players: Array.from(r.players.values()).map(p => p.toJSON()),
+        roundActive: r.roundActive,
+        roundTimeRemaining: getRoomTimeRemainingSeconds(r)
+    }));
+    res.json({ rooms: roomsInfo, totalRooms: rooms.size, tick: serverTickCount });
 });
 
 wss.on('connection', (ws) => {
-    let playerId = null;
+    let player = null; // نمونه‌ی واقعی Player این اتصال (نه فقط شناسه) برای دسترسی مستقیم به room
 
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
@@ -345,21 +361,21 @@ wss.on('connection', (ws) => {
         switch (data.type) {
 
             case 'JOIN': {
-                if (playerId !== null) return; // قبلا جوین شده
+                if (player !== null) return; // قبلا جوین شده
 
-                if (gameState.players.size >= MAX_PLAYERS) {
-                    ws.send(JSON.stringify({
-                        type: 'JOIN_REJECTED',
-                        reason: 'ظرفیت سرور تکمیل است (حداکثر ۲ بازیکن)'
-                    }));
-                    ws.close(1008, 'Server full');
-                    return;
+                const room = getOrCreateRoomForNewPlayer();
+                const newId = nextPlayerId++;
+                const spawnPos = computeSpawnPosition(room, null, PLAYER_SPAWN_NEAR_MIN_DIST, PLAYER_SPAWN_NEAR_MAX_DIST);
+
+                player = new Player(newId, ws, data.name, spawnPos);
+                player.room = room;
+                room.players.set(newId, player);
+
+                const roomFull = room.players.size === MAX_PLAYERS_PER_ROOM;
+                if (roomFull) {
+                    room.roundActive = true;
+                    room.roundEndsAt = Date.now() + ROUND_DURATION_MS;
                 }
-
-                playerId = gameState.nextPlayerId++;
-                const spawnPos = computeSpawnPosition(null, PLAYER_SPAWN_NEAR_MIN_DIST, PLAYER_SPAWN_NEAR_MAX_DIST);
-                const player = new Player(playerId, ws, data.name, spawnPos);
-                gameState.players.set(playerId, player);
 
                 player.send({
                     type: 'JOIN_ACCEPTED',
@@ -368,55 +384,67 @@ wss.on('connection', (ws) => {
                     x: player.x,
                     y: player.y,
                     health: player.health,
-                    roundActive: gameState.roundActive,
-                    roundTimeRemaining: getRoundTimeRemainingSeconds(),
-                    players: Array.from(gameState.players.values()).map(p => p.toJSON()),
-                    maxPlayers: MAX_PLAYERS
+                    waitingForOpponent: !roomFull,
+                    roundActive: room.roundActive,
+                    roundTimeRemaining: getRoomTimeRemainingSeconds(room),
+                    players: Array.from(room.players.values()).map(p => p.toJSON()),
+                    maxPlayers: MAX_PLAYERS_PER_ROOM
                 });
 
-                broadcast({ type: 'PLAYER_JOINED', player: player.toJSON() }, playerId);
+                if (roomFull) {
+                    // بازیکنی که قبلاً منتظر بود، الان هم صاحب حریف تازه شده هم دورش شروع می‌شود
+                    const other = Array.from(room.players.values()).find(p => p.id !== player.id);
+                    if (other) {
+                        other.send({ type: 'PLAYER_JOINED', player: player.toJSON() });
+                        other.send({
+                            type: 'ROUND_STARTED',
+                            durationMs: ROUND_DURATION_MS,
+                            players: Array.from(room.players.values()).map(p => p.toJSON())
+                        });
+                    }
+                }
                 break;
             }
 
             case 'MOVE': {
-                if (playerId === null) return;
-                if (!gameState.roundActive) return;
-                const player = gameState.players.get(playerId);
                 if (!player) return;
-                if (player.updatePosition(data.x, data.y, data.armRotation, data.sliding)) {
-                    broadcast({
+                const room = player.room;
+                if (!room || !room.roundActive) return;
+                if (player.updatePosition(data.x, data.y, data.armRotation, data.sliding, data.legAnim, data.legSpeed)) {
+                    broadcast(room, {
                         type: 'PLAYER_MOVED',
                         playerId: player.id,
                         x: player.x,
                         y: player.y,
                         armRotation: player.armRotation,
-                        sliding: player.isSliding
-                    }, playerId);
+                        sliding: player.isSliding,
+                        legAnim: player.legAnim,
+                        legSpeed: player.legSpeed
+                    }, player.id);
                 }
                 break;
             }
 
             case 'ATTACK': {
-                if (playerId === null) return;
-                const player = gameState.players.get(playerId);
                 if (!player) return;
+                const room = player.room;
+                if (!room) return;
                 const targetIdRaw = data.targetId;
                 const targetId = (targetIdRaw !== undefined && targetIdRaw !== null) ? Number(targetIdRaw) : null;
                 const attackType = typeof data.attackType === 'string' ? data.attackType.slice(0, 20) : 'front';
-                tryAttack(player, Number.isFinite(targetId) ? targetId : null, attackType, data.damage);
+                tryAttack(room, player, Number.isFinite(targetId) ? targetId : null, attackType, data.damage);
                 break;
             }
 
             case 'RESTART_ROUND': {
-                if (playerId === null) return;
-                if (gameState.roundActive) return; // دوری در حال اجراست، نیازی به شروع مجدد نیست
-                startNewRound();
+                if (!player) return;
+                const room = player.room;
+                if (!room || room.roundActive) return;
+                startNewRound(room);
                 break;
             }
 
             case 'PING': {
-                if (playerId === null) return;
-                const player = gameState.players.get(playerId);
                 if (!player) return;
                 const now = Date.now();
                 const ts = typeof data.timestamp === 'number' ? data.timestamp : now;
@@ -432,10 +460,20 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => {
         ws.isAlive = false;
-        if (playerId !== null && gameState.players.has(playerId)) {
-            const player = gameState.players.get(playerId);
-            gameState.players.delete(playerId);
-            broadcast({ type: 'PLAYER_LEFT', playerId: player.id });
+        if (player) {
+            const room = player.room;
+            if (room && room.players.has(player.id)) {
+                room.players.delete(player.id);
+                broadcast(room, { type: 'PLAYER_LEFT', playerId: player.id });
+
+                if (room.players.size === 0) {
+                    rooms.delete(room.id);
+                } else {
+                    // حریف باقی‌مانده باید صبر کند تا بازیکن تازه‌ای به همین روم اضافه شود
+                    room.roundActive = false;
+                    broadcast(room, { type: 'WAITING_FOR_OPPONENT' });
+                }
+            }
         }
     });
 
@@ -458,7 +496,7 @@ const tickInterval = setInterval(gameTick, 1000 / TICK_RATE);
 process.on('SIGINT', () => {
     clearInterval(heartbeatInterval);
     clearInterval(tickInterval);
-    broadcast({ type: 'SERVER_SHUTDOWN', message: 'سرور در حال خاموش شدن است' });
+    rooms.forEach((room) => broadcast(room, { type: 'SERVER_SHUTDOWN', message: 'سرور در حال خاموش شدن است' }));
     wss.clients.forEach((client) => client.close(1000, 'Server shutting down'));
     server.close(() => process.exit(0));
 });
@@ -467,5 +505,5 @@ process.on('uncaughtException', (err) => console.error('Uncaught exception:', er
 process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
 
 server.listen(PORT, () => {
-    console.log(`🚀 سرور بازی روی پورت ${PORT} اجرا شد (ظرفیت: ${MAX_PLAYERS} بازیکن، دور ${ROUND_DURATION_MS / 60000} دقیقه‌ای)`);
+    console.log(`🚀 سرور بازی روی پورت ${PORT} اجرا شد (روم‌بندی خودکار ۲نفره، دور ${ROUND_DURATION_MS / 60000} دقیقه‌ای)`);
 });
