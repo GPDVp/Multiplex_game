@@ -73,6 +73,7 @@ class Player {
         this.isSliding = false;             // فقط جنبه‌ی نمایشی (افکت ذرات اسلاید)
         this.legAnim = 'RESET';             // فقط جنبه‌ی نمایشی (انیمیشن دقیق پا: RESET/run/jump)
         this.legSpeed = 1.0;                // فقط جنبه‌ی نمایشی (سرعت پخش انیمیشن پا)
+        this.facing = 1;                    // فقط جنبه‌ی نمایشی (جهت دقیق مدل: ۱ یا -۱)
         this.lastAttackTime = 0;
         this.lastDamageTime = 0;
         this.lastUpdate = Date.now();
@@ -91,6 +92,7 @@ class Player {
             sliding: this.isSliding,
             legAnim: this.legAnim,
             legSpeed: Math.round(this.legSpeed * 100) / 100,
+            facing: this.facing,
             ping: this.ping
         };
     }
@@ -107,7 +109,7 @@ class Player {
         return false;
     }
 
-    updatePosition(x, y, armRotation, sliding, legAnim, legSpeed) {
+    updatePosition(x, y, armRotation, sliding, legAnim, legSpeed, facing) {
         if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
             return false;
         }
@@ -122,6 +124,9 @@ class Player {
         }
         if (typeof legSpeed === 'number' && isFinite(legSpeed) && legSpeed > 0) {
             this.legSpeed = Math.min(legSpeed, 5);
+        }
+        if (typeof facing === 'number' && isFinite(facing) && facing !== 0) {
+            this.facing = facing;
         }
         this.lastUpdate = Date.now();
         return true;
@@ -410,7 +415,7 @@ wss.on('connection', (ws) => {
                 if (!player) return;
                 const room = player.room;
                 if (!room || !room.roundActive) return;
-                if (player.updatePosition(data.x, data.y, data.armRotation, data.sliding, data.legAnim, data.legSpeed)) {
+                if (player.updatePosition(data.x, data.y, data.armRotation, data.sliding, data.legAnim, data.legSpeed, data.facing)) {
                     broadcast(room, {
                         type: 'PLAYER_MOVED',
                         playerId: player.id,
@@ -419,7 +424,8 @@ wss.on('connection', (ws) => {
                         armRotation: player.armRotation,
                         sliding: player.isSliding,
                         legAnim: player.legAnim,
-                        legSpeed: player.legSpeed
+                        legSpeed: player.legSpeed,
+                        facing: player.facing
                     }, player.id);
                 }
                 break;
